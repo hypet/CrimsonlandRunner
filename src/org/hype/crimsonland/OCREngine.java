@@ -5,7 +5,11 @@ import java.awt.*;
 import java.awt.image.*;
 import java.io.*;
 import java.util.*;
+import java.util.List;
+import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RecursiveAction;
+import java.util.concurrent.RecursiveTask;
 import java.util.concurrent.locks.LockSupport;
 
 public class OCREngine {
@@ -20,12 +24,59 @@ public class OCREngine {
     public static final int SCREENSHOT_RIGHT_BOTTOM_ANGLE_Y = 525;
     public static final int TEXT_BOX_HEIGHT = 15;
     public static final int BW_IMAGE_WHITE_PIXEL_THRESHOLD = 190;
-    private Map<ByteArrayWrapper, Character> chars = new HashMap<ByteArrayWrapper, Character>(30);
-    private LinkedBlockingQueue<String> queue = new LinkedBlockingQueue<String>(50);
-    private boolean LEARNING_MODE = false;
+    public static final int MIN_TEXT_BOX_WIDTH = 30;
+    private static Map<ByteArrayWrapper, Character> chars = new HashMap<ByteArrayWrapper, Character>(30);
+    private static final LinkedBlockingQueue<String> queue = new LinkedBlockingQueue<String>(50);
+    private static boolean LEARNING_MODE = false;
     private int counter = 0;
     private int currentColorThreshold = DARK_TEXT_BOX_COLOR_THRESHOLD;
     private volatile boolean isRunning = true;
+    private ForkJoinPool fjPool = new ForkJoinPool(4);
+
+    static class WordRecognizer extends RecursiveAction {
+
+        private static final int LIMIT = 4;
+        private BufferedImage image;
+        private DarkTextBoxRect[] boxes;
+        private int start, end;
+
+        WordRecognizer(BufferedImage image, DarkTextBoxRect[] boxes, int start, int end) {
+            this.image = image;
+            this.boxes = boxes;
+            this.start = start;
+            this.end = end;
+        }
+
+        @Override
+        protected void compute() {
+            if (end - start < LIMIT) {
+                try {
+                    for(int i = start; i < end; i++){
+                        DarkTextBoxRect box = boxes[i];
+                        String name = getChars(image.getSubimage(box.getX(), box.getY(), box.getX1() - box.getX(), box.getY1() - box.getY()));
+                        try {
+                            if (name != null && name.length() > 0) {
+                                System.out.println("Name: " + name);
+                                queue.put(name);
+                            }
+                        } catch (InterruptedException e) {
+                            System.out.println(e);
+                        }
+                    }
+                } catch (IOException e) {
+                    // NOP
+                }
+            } else {
+                int mid = (start + end)/2;
+                WordRecognizer left = new WordRecognizer(image, boxes, start, mid);
+                WordRecognizer right = new WordRecognizer(image, boxes, mid, end);
+                left.fork();
+                right.fork();
+                left.join();
+                right.join();
+            }
+        }
+    }
 
     public OCREngine() {
         loadMapFromFile();
@@ -61,7 +112,7 @@ public class OCREngine {
         return bwImage;
     }
 
-    public String getChars(BufferedImage image) throws IOException {
+    public static String getChars(BufferedImage image) throws IOException {
         if (image == null) {
             System.out.println("image is null");
             return "";
@@ -94,7 +145,7 @@ public class OCREngine {
         return result.toString();
     }
 
-    private int isSpaceBetweenChars(BufferedImage image, int x) {
+    private static int isSpaceBetweenChars(BufferedImage image, int x) {
         int result = 0;
         if (isColumnEmpty(image, x)) {
             result++;
@@ -107,7 +158,7 @@ public class OCREngine {
         return result;
     }
 
-    private boolean isColumnEmpty(BufferedImage image, int x) {
+    private static boolean isColumnEmpty(BufferedImage image, int x) {
         boolean result = false;
         for (int y = 0; y < image.getHeight(); y++) {
             if (image.getData().getSample(x, y, 0) != 0) {
@@ -120,7 +171,7 @@ public class OCREngine {
         return result;
     }
 
-    private Character extractChar(BufferedImage image, int startOfCharX, int endOfCharX) {
+    private static Character extractChar(BufferedImage image, int startOfCharX, int endOfCharX) {
         byte[][] data = new byte[endOfCharX - startOfCharX][image.getHeight()];
         for (int y = 0; y < image.getHeight(); y++) {
             for (int x = startOfCharX; x < endOfCharX; x++) {
@@ -198,7 +249,7 @@ public class OCREngine {
     /*
         Cuts rectangle image with word. First char starts at (0,0).
      */
-    private BufferedImage getCharsImage(BufferedImage image) {
+    private static BufferedImage getCharsImage(BufferedImage image) {
         boolean isEmptyRow = false;
         int cutX1 = 0;
         int cutWidth = image.getWidth();
@@ -296,7 +347,7 @@ public class OCREngine {
                             if (box.getX1() - box.getX() > TEXT_BOX_HEIGHT
                                     && (box.getY1() < image.getHeight())) {
                                 set.add(box);
-                                x += 30;
+                                x += MIN_TEXT_BOX_WIDTH;
                                 y += TEXT_BOX_HEIGHT;
                             }
                         }
@@ -310,17 +361,7 @@ public class OCREngine {
         start = System.currentTimeMillis();
         System.out.println("Objects found: " + set.size());
         image = getBWImage(image);
-        for (DarkTextBoxRect box : set) {
-            String name = getChars(image.getSubimage(box.getX(), box.getY(), box.getX1() - box.getX(), box.getY1() - box.getY()));
-            try {
-                if (name != null && name.length() > 0) {
-                    System.out.println("Name: " + name);
-                    queue.put(name);
-                }
-            } catch (InterruptedException e) {
-                System.out.println(e);
-            }
-        }
+        fjPool.invoke(new WordRecognizer(image, set.toArray(new DarkTextBoxRect[0]), 0, set.size()));
         System.out.println("Time to recognize chars: " + (System.currentTimeMillis() - start));
     }
 
