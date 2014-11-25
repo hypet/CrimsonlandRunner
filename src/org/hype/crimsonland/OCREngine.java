@@ -5,21 +5,18 @@ import java.awt.*;
 import java.awt.image.*;
 import java.io.*;
 import java.util.*;
-import java.util.List;
-import java.util.concurrent.ForkJoinPool;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.RecursiveAction;
-import java.util.concurrent.RecursiveTask;
+import java.util.concurrent.*;
 import java.util.concurrent.locks.LockSupport;
 
 public class OCREngine {
 
     private static final String DB_FILE = "chars.db";
+    public static final int THREAD_POOL_SIZE = 8;
     public static final int DARK_TEXT_BOX_COLOR_THRESHOLD = 20;
     public static final int MEDIUM_TEXT_BOX_COLOR_THRESHOLD = 30;
     public static final int LIGHT_TEXT_BOX_COLOR_THRESHOLD = 70;
     public static final int INITIAL_GAME_START_DELAY_MS = 16000;
-    public static final int DELAY_BETWEEN_SCREENSHOT_MS = 200;
+    public static final int DELAY_BETWEEN_SCREENSHOT_MS = 400;
     public static final int SCREENSHOT_LEFT_UPPER_ANGLE_Y = 102;
     public static final int SCREENSHOT_RIGHT_BOTTOM_ANGLE_Y = 525;
     public static final int TEXT_BOX_HEIGHT = 15;
@@ -27,59 +24,68 @@ public class OCREngine {
     public static final int MIN_TEXT_BOX_WIDTH = 30;
     private static Map<ByteArrayWrapper, Character> chars = new HashMap<ByteArrayWrapper, Character>(30);
     private static final LinkedBlockingQueue<String> queue = new LinkedBlockingQueue<String>(50);
+    private static final LinkedBlockingQueue<ImageWithRegions> queueImagesWithRegions = new LinkedBlockingQueue<ImageWithRegions>(50);
     private static boolean LEARNING_MODE = false;
     private int counter = 0;
     private int currentColorThreshold = DARK_TEXT_BOX_COLOR_THRESHOLD;
-    private volatile boolean isRunning = true;
-    private ForkJoinPool fjPool = new ForkJoinPool(4);
+    private static volatile boolean isRunning = true;
+    private static ExecutorService threadPool = Executors.newFixedThreadPool(THREAD_POOL_SIZE);
 
-    static class WordRecognizer extends RecursiveAction {
-
-        private static final int LIMIT = 4;
+    static class ImageWithRegions {
         private BufferedImage image;
-        private DarkTextBoxRect[] boxes;
-        private int start, end;
+        private DarkTextBoxRect box;
 
-        WordRecognizer(BufferedImage image, DarkTextBoxRect[] boxes, int start, int end) {
+        ImageWithRegions(BufferedImage image, DarkTextBoxRect box) {
             this.image = image;
-            this.boxes = boxes;
-            this.start = start;
-            this.end = end;
+            this.box = box;
+        }
+
+        public BufferedImage getImage() {
+            return image;
+        }
+
+        public DarkTextBoxRect getBox() {
+            return box;
+        }
+    }
+
+    static class WordRecognizer implements Runnable {
+
+        WordRecognizer() {
         }
 
         @Override
-        protected void compute() {
-            if (end - start < LIMIT) {
+        public void run() {
+            while (isRunning) {
                 try {
-                    for(int i = start; i < end; i++){
-                        DarkTextBoxRect box = boxes[i];
+                    ImageWithRegions imageWithRegions = queueImagesWithRegions.poll(1, TimeUnit.SECONDS);
+                    if (imageWithRegions != null) {
+                        DarkTextBoxRect box = imageWithRegions.getBox();
+                        BufferedImage image = imageWithRegions.getImage();
                         String name = getChars(image.getSubimage(box.getX(), box.getY(), box.getX1() - box.getX(), box.getY1() - box.getY()));
                         try {
                             if (name != null && name.length() > 0) {
-                                System.out.println("Name: " + name);
+                                System.out.println("Thread: " + Thread.currentThread().getName() +  "Name: " + name);
                                 queue.put(name);
                             }
                         } catch (InterruptedException e) {
                             System.out.println(e);
                         }
                     }
-                } catch (IOException e) {
+                } catch (InterruptedException e) {
                     // NOP
+                } catch (IOException e) {
+                    System.out.println(e);
                 }
-            } else {
-                int mid = (start + end)/2;
-                WordRecognizer left = new WordRecognizer(image, boxes, start, mid);
-                WordRecognizer right = new WordRecognizer(image, boxes, mid, end);
-                left.fork();
-                right.fork();
-                left.join();
-                right.join();
             }
         }
     }
 
     public OCREngine() {
         loadMapFromFile();
+        for (int i = 0; i < THREAD_POOL_SIZE; i++) {
+            threadPool.submit(new WordRecognizer());
+        }
     }
 
     private BufferedImage getGrayImage(BufferedImage image) {
@@ -337,7 +343,7 @@ public class OCREngine {
         Set<DarkTextBoxRect> set = new TreeSet<DarkTextBoxRect>();
 
         Raster raster = image.getData();
-        long start = System.currentTimeMillis();
+//        long start = System.currentTimeMillis();
         for (int y = 0; y < height; y = y + 2) {
             for (int x = 0; x < width; x = x + 2) {
                 try {
@@ -357,12 +363,18 @@ public class OCREngine {
                 }
             }
         }
-        System.out.println("Time to find regions: " + (System.currentTimeMillis() - start));
-        start = System.currentTimeMillis();
-        System.out.println("Objects found: " + set.size());
+//        System.out.println("Time to find regions: " + (System.currentTimeMillis() - start));
+//        start = System.currentTimeMillis();
+        System.out.println("DarkTextBoxRects found: " + set.size());
         image = getBWImage(image);
-        fjPool.invoke(new WordRecognizer(image, set.toArray(new DarkTextBoxRect[0]), 0, set.size()));
-        System.out.println("Time to recognize chars: " + (System.currentTimeMillis() - start));
+        for (DarkTextBoxRect box : set) {
+            try {
+                queueImagesWithRegions.put(new ImageWithRegions(image, box));
+            } catch (InterruptedException e) {
+                System.out.println(e);
+            }
+        }
+//        System.out.println("Time to recognize chars: " + (System.currentTimeMillis() - start));
     }
 
     public DarkTextBoxRect getDarkTextBox(Raster raster, int implicitX, int implicitY) {
