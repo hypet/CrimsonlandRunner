@@ -10,3 +10,5 @@ After game start the OCREngine will capture screenshots and then recognize regio
 After word is recognized OCREngine will send the whole word to GameRun's Robot which will pass the word to the game subprocess and then hit Enter.
 
 Currently bot's highest score is 5102.
+
+1234
